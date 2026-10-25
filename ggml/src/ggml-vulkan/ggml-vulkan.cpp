@@ -4488,10 +4488,13 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         VkPhysicalDeviceFaultFeaturesEXT fault_features {};
         fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
-        if (device->device_fault) {
+        // Adreno's vkGetDeviceFaultInfoEXT writes through a null pointer and kills the process.
+        if (device->device_fault && device->vendor_id != VK_VENDOR_ID_QUALCOMM) {
             last_struct->pNext = (VkBaseOutStructure *)&fault_features;
             last_struct = (VkBaseOutStructure *)&fault_features;
             device_extensions.push_back("VK_EXT_device_fault");
+        } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            device->device_fault = false;
         }
 
         vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
