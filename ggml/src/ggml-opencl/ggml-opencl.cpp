@@ -7751,7 +7751,32 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #ifdef GGML_OPENCL_PROFILING
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
-    CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
+    // The screen is another client of this GPU. A low-priority queue lets a
+    // waiting frame run before the next model piece. A piece that has already
+    // started still runs to the end.
+    const bool low_priority = strstr(ext_buffer.data(), "cl_khr_priority_hints") != nullptr;
+    cl_command_queue queue = nullptr;
+    if (low_priority) {
+        cl_queue_properties props[5];
+        int count = 0;
+        props[count++] = 0x1096; // CL_QUEUE_PRIORITY_KHR
+        props[count++] = (cl_queue_properties) (1 << 2); // CL_QUEUE_PRIORITY_LOW_KHR
+        if (command_queue_props != 0) {
+            props[count++] = CL_QUEUE_PROPERTIES;
+            props[count++] = (cl_queue_properties) command_queue_props;
+        }
+        props[count++] = 0;
+        queue = clCreateCommandQueueWithProperties(context, device, props, &err);
+        if (err != CL_SUCCESS || queue == nullptr) {
+            GGML_LOG_WARN("ggml_opencl: low-priority queue was declined (%d)\n", err);
+            queue = nullptr;
+            err = CL_SUCCESS;
+        }
+    }
+    if (queue == nullptr) {
+        CL_CHECK((queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
+    }
+    backend_ctx->queue = queue;
 
     // delay kernel loading until the first buffer is created
     // load_cl_kernels(backend_ctx.get());
@@ -9473,6 +9498,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 // The optimized gemm and gemv kernels are used for large matrices without batch.
 // tensor is the quantized weights matrix.
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    // This phone's Adreno compiler writes wrong Q4_0 results through the
+    // optimized kernels. The portable OpenCL kernels stay available.
+    const char * disable = getenv("GGML_OPENCL_DISABLE_ADRENO_KERNELS");
+    if (disable != nullptr && disable[0] != '\0' && disable[0] != '0') {
+        return false;
+    }
     int64_t threshold_ne0 = 512;
     int64_t threshold_ne1 = 512;
     if (!backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 11, 0) &&
@@ -9557,6 +9588,12 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     // So, exclude A6x and A7x from using Adreno MoE kernels for now.
     // The quants that have a general mul_mat_id kernel fallback to the general version; the
     // rest fallback to CPU.
+    // GGML_OPENCL_DISABLE_MOE skips the repack itself. Rejecting MUL_MAT_ID later is not
+    // enough: the weights are already stored in that layout, and reading them back is garbage.
+    const char * disable_moe = getenv("GGML_OPENCL_DISABLE_MOE");
+    if (disable_moe != nullptr && disable_moe[0] != '\0' && disable_moe[0] != '0') {
+        return false;
+    }
     if (backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) {
